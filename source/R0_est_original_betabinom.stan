@@ -1,0 +1,145 @@
+// R0_est_original_betabinom.stan
+// Purpose: Stan Estimation of R0 using serological survey data. 
+// Version: Estimate R0 simultaneously with estimation of serological profiles (fitting curve). 
+//   -- This is an updated version of the original analysis using a fit of the sero curve and average age of infection.
+// Author: Shaun Truelove, satruelove@gmail.com
+// Date updated: 13 Jan 2020
+
+functions {
+  // Functional form for cumulative seroprevalence. Fits monotonically increasing curve.
+  real x_a_funct(real a, real b0, real b1, real b2){
+    return 1 - exp((b0/b1)*a*exp(-b1*a) + (1/b1)*((b0/b1)-b2)*(exp(-b1*a)-1) - b2*a);
+  }
+}
+
+data {
+  int<lower=1> C;                           // Number of countries
+  int<lower=1> S;                           // Number of separate samples/serosurveys
+  int<lower=1> SA;                          // Number of separate samples/serosurveys x age groups (n rows in data)
+  int<lower=1> N[SA];                       // Number of indivs in each age grp in each serosurvey/sample
+  int<lower=0> Y[SA];                       // Number of seropositive in each age in each serosurvey/sample
+  vector<lower=0,upper=100>[SA] age;        // Age value of each age group
+  vector<lower=0>[S] mu;                    // Birth rate for that country during the year of the survey
+  int<lower=1> country[SA];                 // Country id number for each survey/age
+  int<lower=1> survey[SA];                  // Survey id number for each survey/age
+  int<lower=1> country_of_survey[S];        // Country id for each survey
+  int<lower=1> age_pred_length;
+  vector<lower=0>[age_pred_length] age_pred;
+  matrix[S, age_pred_length] N_age;         // Matrix of population for 0-99 years for each survey 
+  real<lower=0> M;                          // Duration of maternal antibodies
+  //vector<lower=0>[S] L;                    // Birth rate for that country during the year of the survey
+  vector<lower=0>[S] plus1;                    // Birth rate for that country during the year of the survey
+}
+
+parameters {
+  // Serology Model Parameters
+  vector<lower=0,upper=1>[S] b0;       // seroprev function parameter
+  vector<lower=.00001,upper=1>[S] b1;   // seroprev function parameter
+  vector<lower=0,upper=0.05>[S] b2;       // seroprev function parameter
+ 
+  // R0 Parameters
+  real<lower=0,upper=4> logR0_g;                   // Global R0, log-tansformed
+  real<lower=0,upper=10> sigma_g;                             // Standard deviation of global R0 distribution
+  real<lower=0,upper=10> sigma_c;                      // Standard deviation of country R0 distribution
+  vector<lower=0,upper=4>[C] logR0_c;                                            // log R0 for each country
+
+  // Dispersion
+  real<lower=0.0000001, upper=.5> gamma;
+}      
+
+transformed parameters {
+  vector<lower=0,upper=1>[SA] p;                                // binom prob seropositive from each age group in each sample
+  vector[S] R0_s;                                               // R0 for each survey/sample
+  vector[S] Ave_age;                                            // estimated average age of infection
+  vector[S] logR0_s;                                            // log R0 for each survey/sample
+
+  
+  // Fit functional form to seroprev data for each survey
+  for (sa in 1:SA) {
+    p[sa] = x_a_funct(age[sa], b0[survey[sa]], b1[survey[sa]], b2[survey[sa]]);
+  } 
+  
+  // Loop through surveys and get estimates for each, assuming the samples values of b0:b2
+  // -- Use fitted curves/betas to return probability of infection given age
+  // -- calculate average age of infection
+  // -- estimate R0 from average age of infection and birth rate
+  for (s in 1:S) {
+    vector[age_pred_length] p_inf_given_age = rep_vector(0.1, age_pred_length);
+    vector[age_pred_length] n_new_inf_age = rep_vector(0, age_pred_length);
+    real tot_new_inf = 0;
+
+    for (a in 1:age_pred_length){
+      p_inf_given_age[a] = x_a_funct(age_pred[a]+1, b0[s], b1[s], b2[s]) - x_a_funct(age_pred[a], b0[s], b1[s], b2[s]); 
+      n_new_inf_age[a] = p_inf_given_age[a] * N_age[s, a];
+    }
+    tot_new_inf = sum(n_new_inf_age);
+    Ave_age[s] = sum((n_new_inf_age / tot_new_inf) .* age_pred); // Average age of infection
+  }
+  
+  // Vectorized calculations
+  R0_s = plus1 + 1 ./ ((Ave_age - M) .* mu);                          // R0 
+  //R0_s_2 = plus1 + L ./ Ave_age;
+  logR0_s = log(R0_s);                                            // log-trans R0s
+
+
+  // Non-centered version
+  //logR0_s = logR0_g + sigma_g * logR0_s_raw;                     // version without a country level
+  //logR0_c = logR0_g + sigma_g * logR0_c_raw;
+  //logR0_s = logR0_c[country_of_survey] + sigma_c * logR0_s_raw;
+  //logR0_s = logR0_g + beta_survey[survey] + beta_country[country_of_survey];
+} 
+
+model { 
+  // Weakly informative priors (uniform priors are implicitly implied)
+  // b0 ~ uniform(0,1);
+  // b1 ~ uniform(0.00001,1);
+  // b2 ~ uniform(0,0.05);
+  // gamma ~ uniform(0.0000001,1);  
+  // moderately informative prior on global logR0
+  logR0_g ~ normal(1.6,2);                  // informative prior for mean of log(global R0)  -- R0=5
+  sigma_g ~ normal(0,4);                  // informative prior for mean of log(global R0)  -- R0=5
+
+  // target += std_normal_lpdf(logR0_c_raw); // Non-centered version
+  // target += std_normal_lpdf(logR0_s_raw); // Non-centered version
+  for (s in 1:S){
+    target += normal_lpdf(logR0_s[s] | logR0_c[country_of_survey[s]], sigma_c); // Centered version
+  }
+  for (c in 1:C){
+    target += normal_lpdf(logR0_c[c] | logR0_g, sigma_g); // Centered version
+  }
+  
+  // likelihood of number seropositive per survey given number per survey (N) and binom prob seropositive(p) 
+  target += beta_binomial_lpmf(Y | N, (1/gamma-1)*p, (1/gamma - 1)*(1-p)); // to reduce the number of parameters, putting gamma and p in this
+  //target += binomial_lpmf(Y | N, p);   
+}
+
+
+// 
+// generated quantities {
+//   // Manual average age of infection -------------------------------------------
+//   vector<lower=1>[S] R0_survey;       // Predicted survey-specific R0
+//   vector<lower=0,upper=100>[S] Ave_age_post;       // estimated average age of infection\
+//   vector<lower=0,upper=1>[age_pred_length] p_inf_given_age_post;
+//   vector<lower=0>[age_pred_length] n_new_inf_age_post;
+//   real tot_new_inf_post;
+//   real R0g;
+//   real R0c[C];
+// 
+//   for (s in 1:S) {
+//     // new infections - proportion per age group;
+//     for (a in 1:age_pred_length){
+//       p_inf_given_age_post[a] = x_a_funct(age_pred[a], b0[s], b1[s], b2[s]) - x_a_funct(age_pred[a]+1, b0[s], b1[s], b2[s]);
+//       n_new_inf_age_post[a] = p_inf_given_age_post[a] * N_age[s, a];
+//     }
+//     tot_new_inf_post = sum(n_new_inf_age_post);
+// 
+//     Ave_age_post[s] = sum((n_new_inf_age_post / tot_new_inf_post) .* ((age_pred)+0.5));
+//     R0_survey[s] = 1 + ( (1/mu[s]) / Ave_age_post[s] );     // R0
+//   }
+// 
+//   R0c = exp(normal_rng(logR0_c, sigma_c));
+//   R0s = exp(normal_rng(logR0_g, sigma_c+sigma_g));
+// 
+// }
+
+

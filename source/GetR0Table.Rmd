@@ -1,0 +1,324 @@
+---
+title: "R0 Estimates"
+author: "Shaun Truelove"
+date: "February 5, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#source('R0_model/source/load_and_cleanR0__data.R')
+
+library(knitr)
+library(tidyverse)
+library(rstan)
+library(globaltoolbox)
+
+opts_chunk$set(echo = TRUE)
+root.dir <- rprojroot::find_rstudio_root_file()
+opts_knit$set(root.dir = root.dir)
+```
+
+
+Import the data
+
+```{r}
+# global arguments
+analysis_version <- "Jan2020_farrington_method"
+analysis_version_repo <- file.path('../results',analysis_version,'R0')
+dir.create(analysis_version_repo, recursive = TRUE)
+
+load(file=file.path(analysis_version_repo,'R0_full_3000iters.RData')) # Loads ret_sm, fitR0__test, sero_data_stan_list
+fits <- rstan::extract(fitR0_)
+
+countryregion_of_survey  <- sero_data %>% filter(!duplicated(survey.num)) %>% select(survey.num, ISO, country.num, country, sub.region, region.num) %>% as.data.frame()    # Index id number for region of each survey names(region_of_survey) <- sero_data$sub.region[!duplicated(sero_data$survey.num)]     # Index id number for region of each survey
+
+region_of_country <- sero_data %>% filter(!duplicated(country.num)) %>% select(country.num, ISO, sub.region, region.num) %>% as.data.frame()
+
+```
+
+## R0 by Survey
+
+```{r}
+R0_survey_tmp <- exp(fits$logR0_s)
+R0_survey <- data.frame(country = NA,
+                        ISO = countryregion_of_survey$ISO[match(sero_data_stan$country_of_survey, countryregion_of_survey$country.num)],
+                        region = countryregion_of_survey$sub.region[match(sero_data_stan$country_of_survey, countryregion_of_survey$country.num)],
+                        survey = unique((sero_data$survey.ind)), 
+                        mean_log = apply(fits$logR0_s, 2, mean),
+                        mean = exp(apply(fits$logR0_s, 2, mean)),
+                        median = exp(apply(fits$logR0_s, 2, median)),
+                        LL = exp(apply(fits$logR0_s, 2, quantile, probs=0.025)),
+                        UL = exp(apply(fits$logR0_s, 2, quantile, probs=0.975)))
+R0_survey$country <- get_country_name_ISO3(R0_survey$ISO)
+
+write_csv(R0_survey, file.path(analysis_version_repo,"R0_surveys.csv"))
+
+```
+
+
+## R0 by Country
+
+```{r}
+R0_country_summary <- data.frame(country = unique((sero_data_stan[["country"]])), 
+                                 mean = exp(apply(fits$logR0_c, 2, mean)),
+                                 median = exp(apply(fits$logR0_c, 2, median)),
+                                 LL = exp(apply(fits$logR0_c, 2, quantile, probs=0.025)),
+                                 UL = exp(apply(fits$logR0_c, 2, quantile, probs=0.975)),
+                                 log_mean = apply(fits$logR0_c, 2, mean),
+                                 log_sd = apply(fits$logR0_c, 2, sd),
+                                 n_surveys = NA)
+country_codes <- data.frame(country=unique(sero_data$ISO), country.num=unique(sero_data$country.num))
+R0_country_summary$country <- country_codes$country[match(R0_country_summary$country, country_codes$country.num)]
+
+# Get number of surveys per country
+n_surveys <- table(R0_survey$country)
+countries_ <- globaltoolbox::get_iso(names(n_surveys))
+R0_country_summary$n_surveys <- as.integer(n_surveys)[match(countries_, R0_country_summary$country)]
+# R0_country_summary <- R0_country_summary %>% mutate(
+#   LL3 = exp(log_mean - 1.96*log_sd),
+#   UL3 = exp(log_mean + 1.96*log_sd)) 
+
+write_csv(R0_country_summary, file.path(analysis_version_repo, "R0_countries.csv"))
+
+```
+
+
+## R0 by Region
+
+
+```{r}
+
+region <- sero_data_stan[["region_of_survey"]]
+region_country <- sero_data_stan[["region_of_country"]]
+#region_country <- sero_data_stan[["country"]]
+regions <- unique(region)
+
+r0_region <- NULL
+logR0_s <- fits$logR0_s
+for (r in 1:length(regions)){
+  r0_ <- as.numeric(logR0_s[,region %in% regions[r]])
+  r0_region <- rbind(r0_region, 
+                c(exp(mean(r0_)), exp(quantile(r0_, probs=c(0.025, 0.975)))))
+}
+
+
+tmp <- table(region)
+r0_region <- data.frame(regions, r0_region)
+match_ <- match(as.integer(names(tmp)), as.integer(r0_region$regions))
+r0_region$n_surveys <- tmp[match_]
+
+region_info <- countryregion_of_survey[!duplicated(countryregion_of_survey$region.num),] %>%
+  dplyr::select(region.num, sub.region)
+
+match_ <- match(as.integer(region_info$region.num), as.integer(r0_region$regions))
+r0_region$region_names <- region_info$sub.region[match_]
+
+country_count <- countryregion_of_survey %>% group_by(sub.region) %>% 
+  summarise(n_country = length(unique(country)))
+
+
+r0_region <- r0_region %>% mutate(R0=paste0(round(V1,2), " (", round(X2.5., 2), "-", round(X97.5.,2),")")) %>%
+  select(region_names, R0, n_surveys, n_country) 
+r0_region <- left_join(r0_region, country_count, by=c("region_names"="sub.region"))
+
+write_csv(r0_region, file.path("..", "..", analysis_version_repo,"R0_region.csv"))
+
+
+```
+
+
+
+```{r} 
+
+R0_survey <- R0_survey %>% group_by(region)
+
+
+R0_region_summary <- data.frame(region = unique((sero_data_stan[["region_of_country"]])), 
+                                 mean = exp(apply(fits$logR0_r, 2, mean)),
+                                 median = exp(apply(fits$logR0_r, 2, median)),
+                                 LL = exp(apply(fits$logR0_r, 2, quantile, probs=0.025)),
+                                 UL = exp(apply(fits$logR0_r, 2, quantile, probs=0.975)),
+                                 log_mean = apply(fits$logR0_r, 2, mean),
+                                 log_sd = apply(fits$logR0_r, 2, sd),
+                                 n_surveys = NA,
+                                 n_countries = NA)
+region_codes <- data.frame(region=unique(sero_data$sub.region), region.num=unique(sero_data$region.num))
+R0_region_summary$region <- region_codes$region[match(R0_region_summary$region, region_codes$region.num)]
+# R0_region_summary <- R0_region_summary %>% mutate(
+#   LL3 = exp(log_mean - 1.96*log_sd),
+#   UL3 = exp(log_mean + 1.96*log_sd))          
+
+# Get number of surveys per region
+n_surveys <- table(sero_data_stan[["region_of_survey"]])
+regions_ <- region_codes$region[match(names(n_surveys), region_codes$region.num)]
+R0_region_summary$n_surveys <- as.integer(n_surveys)[match(regions_, R0_region_summary$region)]
+
+# Get number of countries per region
+n_countries <- table(sero_data_stan[["region_of_country"]])
+regions_ <- region_codes$region[match(names(n_countries), region_codes$region.num)]
+R0_region_summary$n_countries <- as.integer(n_countries)[match(regions_, R0_region_summary$region)]
+
+countries_ <- unique(sero_data_stan[["country_name"]])
+countrycodes_ <- globaltoolbox::get.iso(countries_)
+regions_ <- globaltoolbox::get.subregion(countrycodes_)
+country_region <- data.frame(country=countries_, countrycode=countrycodes_, region=regions_)
+
+write_csv(R0_region_summary, file.path(analysis_version_repo, "R0_regions.csv"))
+
+```
+
+# R0 Global
+
+```{r}
+R0g_mean <- exp(mean(fits$logR0_g))
+logR0g_mean <- mean(fits$logR0_g)
+logR0g_sd <- sd(fits$logR0_g)
+R0g_ll <- exp(quantile(fits$logR0_g, 0.025))
+R0g_ul <- exp(quantile(fits$logR0_g, 0.975))
+
+print(paste0(round(R0g_mean,2), " (95% CI, ",round(R0g_ll,2), "-", round(R0g_ul,2),")"))
+```
+
+## Get R0 by Region
+
+```{r}
+colnames(R0_region_summary)
+
+# Get all regions
+all_regions <- data.frame(region=ordered(c("World", unique(region_data$sub.region)), 
+                                  levels=c("World", unique(region_data$sub.region))))
+
+R0_worldregion <- R0_region_summary %>% select(region, mean, LL, UL, n_surveys, n_countries) # %>%
+                                        #mutate(region=factor(as.character(all_regions$region), levels=all_regions$region))
+R0_worldregion <- bind_rows(data.frame(region="World", mean=R0g_mean, LL=R0g_ll, UL=R0g_ul, 
+                                       n_surveys=sum(R0_worldregion$n_surveys),
+                                       n_countries=sum(R0_worldregion$n_countries)), R0_worldregion)
+R0_worldregion <- full_join(R0_worldregion, all_regions, by=c("region"="region"))
+
+R0_worldregion <- R0_worldregion %>% mutate(R0 = paste0(round(mean,2), " (95% CI, ", 
+                                                        round(LL,2), "-", round(UL,2),")")) %>%
+                                      select(Region=region, R0=R0, N_surveys=n_surveys, N_countries=n_countries)
+
+write_csv(R0_worldregion, file.path(analysis_version_repo, "R0_region_table.csv"))
+
+```
+
+
+
+## Table of Priority countries
+
+```{r}
+
+# PUT TOGETHER INTO FINAL DATASET -----------------------------------------
+
+priority_countries <- read_csv(file="R0_model/data/Requested_VIMC_countries_Rubella.csv") %>%
+                              as.data.frame() %>% mutate(req_country=TRUE)
+priority_countries <- priority_countries %>% 
+  rename(ISO=iso3) %>%
+  mutate(sub.region=globaltoolbox::get.subregion(ISO)) %>% 
+  mutate(CountryEst=FALSE, RegionalEst=FALSE, GlobalEst=FALSE) %>%
+  select(-country)
+
+# Add country estimates
+priority_countries <- full_join(priority_countries, R0_country_summary, by=c("ISO"="country")) %>% 
+  rename(R0_mean=mean, R0_ll=LL, R0_ul=UL, logR0_mean=log_mean, logR0_sd=log_sd) %>% select(-median) %>%
+  mutate(CountryEst = ifelse(!is.na(R0_mean), TRUE, FALSE),
+         RegionalEst = ifelse(is.na(R0_mean), TRUE, FALSE)) %>% 
+  mutate(req_country=ifelse(is.na(req_country), FALSE, req_country),
+         sub.region=ifelse(is.na(sub.region), globaltoolbox::get.subregion(ISO), sub.region))
+
+# Add regional estimates
+priority_countries <- left_join(priority_countries, R0_region_summary %>% select(-n_surveys, -n_countries),
+                                by=c("sub.region"="region")) %>% 
+  mutate(RegionalEst = ifelse(is.na(R0_mean) & !is.na(mean), TRUE, FALSE)) %>%
+  mutate(R0_mean=ifelse(is.na(R0_mean), mean, R0_mean), 
+         R0_ll=ifelse(is.na(R0_ll), LL, R0_ll),
+         R0_ul=ifelse(is.na(R0_ul), UL, R0_ul), 
+         logR0_mean=ifelse(is.na(logR0_mean), log_mean, logR0_mean),
+         logR0_sd=ifelse(is.na(logR0_sd), log_sd, logR0_sd)) %>% select(-median, -mean, -LL, -UL, -log_mean, -log_sd)
+
+# Add Global Est
+priority_countries <- priority_countries %>%
+  mutate(GlobalEst = ifelse(is.na(R0_mean), TRUE, FALSE)) %>%
+  mutate(R0_mean=ifelse(is.na(R0_mean), R0g_mean, R0_mean), 
+         R0_ll=ifelse(is.na(R0_ll), R0g_ll, R0_ll),
+         R0_ul=ifelse(is.na(R0_ul), R0g_ul, R0_ul), 
+         logR0_mean=ifelse(is.na(logR0_mean), logR0g_mean, logR0_mean),
+         logR0_sd=ifelse(is.na(logR0_sd), logR0g_sd, logR0_sd))
+
+# Define source in 1 variable
+priority_countries <- priority_countries %>% mutate(Source=ifelse(CountryEst==TRUE, "Country-specific",
+                                                           ifelse(RegionalEst==TRUE, "Region-specific", "Global")))
+# Add reference info
+survey_info <- sero_data[!duplicated(sero_data$survey.num),] 
+survey_info <- survey_info %>% select(country, ISO, reference_id, #author, year_published, 
+                                      mid.survey.year, survey.ind, survey.num) #%>%
+                              #mutate(author=Hmisc::capitalize(author), ref=paste0(author, " ", year_published) )
+
+country_refs <- data.frame(Country=unique(survey_info$country), ISO=get.iso(unique(survey_info$country)), 
+                           N_surveys=NA, Survey_years=NA, Refs=NA)
+for (i in 1:nrow(country_refs)){
+  country_refs$N_surveys[i] <- sum(survey_info$ISO==country_refs$ISO[i])
+  country_refs$Survey_years[i] <- paste0(unique(survey_info$mid.survey.year[survey_info$ISO==country_refs$ISO[i]]), collapse = ", ")
+  country_refs$Refs[i] <- paste0(unique(survey_info$reference_id[survey_info$ISO==country_refs$ISO[i]]), collapse = ", ")
+}
+
+# Join with reference data
+priority_countries <- full_join(priority_countries, country_refs, by=c("ISO"="ISO")) 
+priority_countries <- priority_countries %>% select(-n_surveys, -logR0_mean, -logR0_sd)
+
+priority_countries <- priority_countries %>% mutate(R0ci=paste0(format(round(R0_mean,1), nsmall=1), " (", 
+                                                                format(round(R0_ll,1), nsmall=1), "-", 
+                                                                format(round(R0_ul,1), nsmall=1), ")"),
+                                                    Country=globaltoolbox::get_country_name_ISO3(ISO))
+
+priority_countries2 <- priority_countries %>% select(Country, ISO, VIMC_98=req_country, 
+                                                     Region=sub.region, `R0 mean (95% CI)`=R0ci, 
+                                                    Source, `No. Surveys`=N_surveys, 
+                                                    `Survey years`=Survey_years, References=Refs) %>%
+                                              mutate(`No. Surveys`=ifelse(is.na(`No. Surveys`),0,`No. Surveys`),
+                                                     `Survey years`=ifelse(is.na(`Survey years`),"-",`Survey years`),
+                                                     References=ifelse(is.na(References),"-",References))
+
+write_csv(priority_countries2, file.path("..", "..", analysis_version_repo,"R0_country_table2.csv"))
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+R0ests <- read_csv("../data/R0_distributions_v2.csv") %>% as.data.frame()
+regions <- sort(unique(R0ests$sub.region))
+countries <- sort(unique(R0ests$country))
+# 
+# country.reg.info <- 
+# 
+# 
+#   
+#   
+#   
+# 
+# res_data <- data.frame(Location=NA, R0=NA, R0_ll=NA, R0_ul=NA)
+# 
+# 
+# for (i in 1:length(regions)){ 
+#   
+#   tmp <- R0ests %>% filter(sub.region==regions[i] & RegionalEst==TRUE)
+# 
+#   reg_row <- data.frame(Location=regions(i), R0=)
+#   
+#   res_data <- rbind(res_data, tmp)
+
+
+
+```
+
